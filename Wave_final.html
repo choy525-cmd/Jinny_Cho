@@ -1,0 +1,434 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1.0" />
+  <title>Surface vs Depth — Collapse Loop (Click)</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+    canvas { position: absolute; inset: 0; display: block; }
+  </style>
+</head>
+<body>
+  <canvas id="surface"></canvas>
+  <canvas id="fx"></canvas>
+  <canvas id="depth"></canvas>
+
+<script>
+/**
+ * Surface vs Depth — Collapse Loop
+ * - Move mouse: reveal "depth" through a soft mask
+ * - Click: triggers collapse (adds higher-frequency surface detail + global reveal)
+ * - Auto-restores back to idle after a short hold
+ */
+
+(() => {
+  // ---------- Canvas setup ----------
+  const cvsSurface = document.getElementById("surface");
+  const cvsFX      = document.getElementById("fx");
+  const cvsDepth   = document.getElementById("depth");
+
+  const ctxS = cvsSurface.getContext("2d");
+  const ctxF = cvsFX.getContext("2d");
+  const ctxD = cvsDepth.getContext("2d");
+
+  let W = 0, H = 0, dpr = 1;
+
+  function resize() {
+    dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+    W = window.innerWidth;
+    H = window.innerHeight;
+
+    for (const c of [cvsSurface, cvsFX, cvsDepth]) {
+      c.width  = Math.floor(W * dpr);
+      c.height = Math.floor(H * dpr);
+      c.style.width  = W + "px";
+      c.style.height = H + "px";
+    }
+
+    for (const ctx of [ctxS, ctxF, ctxD]) ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+
+  window.addEventListener("resize", resize);
+  resize();
+
+  // ---------- Helpers ----------
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const lerp  = (a, b, t) => a + (b - a) * t;
+
+  const easeInOut = (t) => (t < 0.5)
+    ? 2 * t * t
+    : 1 - Math.pow(-2 * t + 2, 2) / 2;
+
+  const easeOut = (t) => 1 - Math.pow(1 - t, 3);
+
+  // ---------- Input ----------
+  const mouse = { x: 0, y: 0, px: 0, py: 0, v: 0 };
+  mouse.x = mouse.px = W / 2;
+  mouse.y = mouse.py = H / 2;
+
+  window.addEventListener("mousemove", (e) => {
+    mouse.x = e.clientX;
+    mouse.y = e.clientY;
+  });
+
+  // ---------- Timeline state machine ----------
+  const COLLAPSE_DURATION = 2400; // ms
+  const HOLD_AT_END       =  800; // ms
+  const RESTORE_DURATION  = 2000; // ms
+
+  let state = "idle";     // idle -> collapsing -> hold -> restoring -> idle
+  let stateStart = 0;     // performance.now()
+  let collapseP = 0;      // 0..1
+
+  window.addEventListener("click", () => {
+    if (state === "idle") {
+      state = "collapsing";
+      stateStart = performance.now();
+    }
+  });
+
+  function updateState(now) {
+    if (state === "idle") { collapseP = 0; return; }
+
+    const elapsed = now - stateStart;
+
+    if (state === "collapsing") {
+      const raw = elapsed / COLLAPSE_DURATION;
+      collapseP = clamp(raw, 0, 1);
+      if (raw >= 1) {
+        state = "hold";
+        stateStart = now;
+        collapseP = 1;
+      }
+      return;
+    }
+
+    if (state === "hold") {
+      collapseP = 1;
+      if (elapsed >= HOLD_AT_END) {
+        state = "restoring";
+        stateStart = now;
+      }
+      return;
+    }
+
+    if (state === "restoring") {
+      const raw = elapsed / RESTORE_DURATION;
+      collapseP = clamp(1 - raw, 0, 1);
+      if (raw >= 1) {
+        state = "idle";
+        stateStart = 0;
+        collapseP = 0;
+        ripples.length = 0; // clean reset
+      }
+    }
+  }
+
+  // ---------- Ripples ----------
+  const ripples = [];
+  function addRipple(x, y, p) {
+    ripples.push({ x, y, r: 0, p, life: 1 });
+    if (ripples.length > 10) ripples.shift();
+  }
+
+  // ---------- Global time (slows during collapse) ----------
+  let t = 0;
+
+  // ---------- Waves: base + collapse-driven high-frequency detail ----------
+  function fbm(x, time, i, cp) {
+    const base =
+      Math.sin(x * 0.010 + time * 0.9 + i * 0.22) * 1.0 +
+      Math.sin(x * 0.018 - time * 0.6 + i * 0.15) * 0.55 +
+      Math.sin(x * 0.031 + time * 0.33 + i * 0.09) * 0.25;
+
+    // Higher-frequency detail increases during collapse (and fades on restore)
+    const hfAmt = 1.35 * easeInOut(cp); // 0 -> 0.55
+    const hf =
+      Math.sin(x * 0.070 + time * 3.6 + i * 0.40) * 0.60 +
+      Math.sin(x * 0.120 - time * 4.2 + i * 0.18) * 0.30 +
+      Math.sin(x * 0.190 + time * 5.1 + i * 0.11) * 0.16;
+
+    return base + hf * hfAmt;
+  }
+
+  // ---------- Depth layer ----------
+  function drawDepth(maskRadius, depthAlpha) {
+    ctxD.clearRect(0, 0, W, H);
+
+    ctxD.fillStyle = "#040a12";
+    ctxD.fillRect(0, 0, W, H);
+
+    ctxD.globalCompositeOperation = "screen";
+
+    const gridA1 = lerp(0.12, 0.26, depthAlpha);
+    const gridA2 = lerp(0.07, 0.14, depthAlpha);
+
+    ctxD.lineWidth = 1;
+    for (const step of [36, 130]) {
+      ctxD.strokeStyle = (step === 36)
+        ? `rgba(160,200,255,${gridA1})`
+        : `rgba(245,248,255,${gridA2})`;
+
+      for (let x = 0; x <= W; x += step) {
+        ctxD.beginPath(); ctxD.moveTo(x, 0); ctxD.lineTo(x, H); ctxD.stroke();
+      }
+      for (let y = 0; y <= H; y += step) {
+        ctxD.beginPath(); ctxD.moveTo(0, y); ctxD.lineTo(W, y); ctxD.stroke();
+      }
+    }
+
+    const crackCount = Math.floor(lerp(18, 52, depthAlpha));
+    ctxD.strokeStyle = `rgba(245,248,255,${lerp(0.14, 0.26, depthAlpha)})`;
+    ctxD.lineWidth = 1;
+    ctxD.beginPath();
+
+    for (let k = 0; k < crackCount; k++) {
+      let x = (k / crackCount) * W + (Math.sin(t * 0.5 + k) * 36);
+      let y = H * (0.25 + (k % 7) * 0.02) + Math.sin(k * 1.9 + t * 0.7) * 120;
+
+      ctxD.moveTo(x, y);
+
+      const segs = 8 + (k % 5);
+      for (let j = 0; j < segs; j++) {
+        const ang = Math.sin(k * 12.3 + j * 4.7 + t * 0.8) * Math.PI;
+        x += Math.cos(ang) * (34 + (k % 3) * 18);
+        y += Math.sin(ang) * (34 + (j % 3) * 18);
+        ctxD.lineTo(x, y);
+      }
+    }
+    ctxD.stroke();
+
+    ctxD.globalCompositeOperation = "source-over";
+
+    // radial mask (reveals depth)
+    ctxD.globalCompositeOperation = "destination-in";
+    const fullCut = Math.max(W, H) * 1.2;
+
+    if (maskRadius >= fullCut) {
+      ctxD.fillStyle = "rgba(255,255,255,1)";
+      ctxD.fillRect(0, 0, W, H);
+    } else {
+      const g = ctxD.createRadialGradient(mouse.x, mouse.y, 0, mouse.x, mouse.y, maskRadius);
+      g.addColorStop(0,    "rgba(255,255,255,1)");
+      g.addColorStop(0.72, "rgba(255,255,255,0.92)");
+      g.addColorStop(1,    "rgba(255,255,255,0)");
+      ctxD.fillStyle = g;
+      ctxD.fillRect(0, 0, W, H);
+    }
+
+    ctxD.globalCompositeOperation = "source-over";
+  }
+
+  // ---------- Surface layer ----------
+  function drawSurface(maskRadius, cp) {
+    const surfaceFade = lerp(1.0, 0.08, easeOut(cp));
+
+    ctxS.fillStyle = "#02060d";
+    ctxS.fillRect(0, 0, W, H);
+
+    const lines = 72;
+    const persp = (i) => Math.pow(i / (lines - 1), 1.85);
+
+    const R = maskRadius;
+    const pullStrength  = lerp(105, 150, cp);
+    const tearStrength  = lerp(0.55, 2.2, easeInOut(cp));
+    const ampScale      = lerp(1.0, 0.55, easeOut(cp));
+    const shimmerScale  = lerp(1.0, 0.15, easeOut(cp));
+
+for (let pass = 0; pass < 2; pass++) {
+
+  const baseWidth = (pass === 0) ? 2.2 : 1.0;
+
+  // Line gets thicker during collapse
+  const thicknessBoost = lerp(1.0, 3.5, easeInOut(cp));
+
+  ctxS.lineWidth = baseWidth * thicknessBoost;
+      const baseA = ((pass === 0) ? 0.10 : 0.48) * surfaceFade;
+
+      for (let i = 0; i < lines; i++) {
+        ctxS.beginPath();
+        let penDown = false;
+
+        for (let x = 0; x <= W; x += 7) {
+          const baseY = persp(i) * H;
+          const wave  = fbm(x, t, i, cp) * 18 * ampScale;
+
+          let y = baseY + wave;
+
+          const dist = Math.hypot(x - mouse.x, y - mouse.y);
+          const m = Math.exp(-(dist * dist) / (2 * R * R));
+
+          // pull + shimmer near cursor
+          y -= m * pullStrength * 0.50;
+          y += Math.sin((x * 0.02) + t * 2.6 + i * 0.22) * (m * pullStrength * 0.08);
+          y += (Math.sin(x * 0.06 + t * 6.0) * 1.2) * (0.30 + m) * shimmerScale;
+
+          // ripple rings
+          for (const r of ripples) {
+            const dd = Math.hypot(x - r.x, y - r.y);
+            const ring = Math.exp(-Math.pow((dd - r.r), 2) / (2 * 140 * 140));
+            y += ring * 26 * r.p;
+          }
+
+          // tearing logic
+          const globalTear = lerp(0.0, 0.22, easeInOut(cp));
+          const tearProb = clamp((m * 1.15 + globalTear) * tearStrength, 0, 0.98);
+          const cut = Math.random() < tearProb * 0.07;
+          const extraCuts = Math.random() < (cp > 0.5 ? tearProb * 0.10 : 0);
+
+          if (!penDown) {
+            ctxS.moveTo(x, y);
+            penDown = true;
+          } else if (cut || extraCuts) {
+            ctxS.stroke();
+            ctxS.beginPath();
+            penDown = false;
+          } else {
+            ctxS.lineTo(x, y);
+          }
+
+          // stroke style (per pass)
+          if (pass === 0) {
+            ctxS.strokeStyle = `rgba(170,210,255,${baseA + m * 0.45 * surfaceFade})`;
+          } else {
+            ctxS.strokeStyle = `rgba(240,245,255,${baseA + m * 0.28 * surfaceFade})`;
+          }
+        }
+
+        ctxS.stroke();
+      }
+    }
+
+    // vignette
+    const vg = ctxS.createRadialGradient(W * 0.5, H * 0.55, 50, W * 0.5, H * 0.55, Math.max(W, H) * 0.8);
+    vg.addColorStop(0, "rgba(0,0,0,0)");
+    vg.addColorStop(1, "rgba(0,0,0,0.55)");
+    ctxS.fillStyle = vg;
+    ctxS.fillRect(0, 0, W, H);
+  }
+
+  // ---------- FX layer ----------
+  function drawFX(localRadius, cp) {
+    ctxF.clearRect(0, 0, W, H);
+
+    const Rlocal  = localRadius;
+    const Rglobal = lerp(Rlocal, Math.max(W, H) * 0.7, easeInOut(cp));
+    const intensity = lerp(0.65, 1.0, easeInOut(cp));
+
+    ctxF.globalCompositeOperation = "lighter";
+
+    // streaks near cursor
+    const streakCount = Math.floor(lerp(18, 30, cp));
+    for (let k = 0; k < streakCount; k++) {
+      const rx = mouse.x + (Math.random() * 2 - 1) * Rlocal;
+      const ry = mouse.y + (Math.random() * 2 - 1) * Rlocal;
+
+      const dist = Math.hypot(rx - mouse.x, ry - mouse.y);
+      const m = Math.exp(-(dist * dist) / (2 * Rlocal * Rlocal));
+
+      if (Math.random() < m * 0.45 * intensity) {
+        const h = 16 + Math.random() * 90;
+        const w = 1 + Math.random() * 2;
+        ctxF.fillStyle = `rgba(240,245,255,${m * 0.14})`;
+        ctxF.fillRect(rx, ry - h * 0.5, w, h);
+      }
+    }
+
+    // particles
+    const bubbleCount = Math.floor(lerp(380, 820, easeInOut(cp)));
+    for (let i = 0; i < bubbleCount; i++) {
+      const useGlobal = Math.random() < easeInOut(cp) * 0.65;
+      const R = useGlobal ? Rglobal : Rlocal;
+
+      const a = Math.random() * Math.PI * 2;
+      const r = Math.random() * R;
+
+      const cx = useGlobal ? W * 0.5 : mouse.x;
+      const cy = useGlobal ? H * 0.55 : mouse.y;
+
+      const x = cx + Math.cos(a) * r;
+      const y = cy + Math.sin(a) * r;
+
+      const m = Math.exp(-(r * r) / (2 * R * R));
+
+      if (Math.random() < m * 0.85 * intensity) {
+        const rr = 0.6 + Math.random() * 1.8;
+
+        ctxF.fillStyle = `rgba(255,255,255,${m * 0.28})`;
+        ctxF.beginPath(); ctxF.arc(x, y, rr, 0, Math.PI * 2); ctxF.fill();
+
+        ctxF.strokeStyle = `rgba(180,220,255,${m * 0.14})`;
+        ctxF.lineWidth = 1;
+        ctxF.beginPath(); ctxF.arc(x, y, rr + 1.1, 0, Math.PI * 2); ctxF.stroke();
+      }
+    }
+
+    // fog during collapse
+    if (cp > 0.1) {
+      const fog = ctxF.createRadialGradient(W * 0.5, H * 0.55, 0, W * 0.5, H * 0.55, Math.max(W, H) * 0.9);
+      fog.addColorStop(0, `rgba(180,220,255,${0.02 + cp * 0.06})`);
+      fog.addColorStop(1, "rgba(0,0,0,0)");
+      ctxF.fillStyle = fog;
+      ctxF.fillRect(0, 0, W, H);
+    }
+
+    ctxF.globalCompositeOperation = "source-over";
+  }
+
+  // ---------- Main loop ----------
+  let last = performance.now();
+
+  function loop(now) {
+    // mouse speed
+    const dxm = mouse.x - mouse.px;
+    const dym = mouse.y - mouse.py;
+    mouse.v = Math.hypot(dxm, dym);
+    mouse.px = mouse.x;
+    mouse.py = mouse.y;
+
+    updateState(now);
+
+    const cp  = collapseP;
+    const cpe = easeInOut(cp);
+
+    // time slows during collapse and returns during restore
+    const timeSpeed = lerp(1.0, 0.02, easeOut(cp));
+    t += 0.018 * timeSpeed;
+
+    // mask radius expands during collapse
+    const baseRadius = clamp(160 + mouse.v * 8, 180, 360);
+    const fullRadius = Math.max(W, H) * 1.6;
+    const maskRadius = lerp(baseRadius, fullRadius, cpe);
+
+    // ripples: interactive early; pulses during collapse/restore
+    if (mouse.v > 6 && cp < 0.35) {
+      addRipple(mouse.x, mouse.y, clamp(mouse.v * 0.14, 0.8, 2.0));
+    }
+    if (state === "collapsing" && Math.abs(Math.sin(now / 260)) < 0.03 && cp > 0.12 && cp < 0.9) {
+      addRipple(W * 0.5, H * 0.55, 1.2 + cp * 0.8);
+    }
+    if (state === "restoring" && Math.abs(Math.sin(now / 320)) < 0.03 && cp < 0.85) {
+      addRipple(mouse.x, mouse.y, 0.9);
+    }
+
+    // draw layers
+    drawSurface(maskRadius, cp);
+    drawFX(baseRadius, cp);
+    drawDepth(maskRadius * 1.15, cpe);
+
+    // ripple update
+    for (let i = ripples.length - 1; i >= 0; i--) {
+      ripples[i].r += 16 + ripples[i].p * 7;
+      ripples[i].life -= 0.03;
+      if (ripples[i].life <= 0) ripples.splice(i, 1);
+    }
+
+    requestAnimationFrame(loop);
+  }
+
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
